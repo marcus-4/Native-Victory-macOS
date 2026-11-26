@@ -893,6 +893,11 @@ impl CopyLocation {
     pub(crate) fn whole(resource: This) -> Self {
         Self { resource, kind: 0, footprint: crate::resource::PlacedFootprint::new(0, 0, 0, 0, 0) }
     }
+    /// Subresource `index` of `resource` (the native host's tests).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn subresource(resource: This, index: u64) -> Self {
+        Self { resource, kind: 0, footprint: crate::resource::PlacedFootprint::new(index, 0, 0, 0, 0) }
+    }
 }
 
 #[cfg(target_os = "macos")]

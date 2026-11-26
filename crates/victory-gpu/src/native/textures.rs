@@ -55,6 +55,12 @@ impl TextureInfo {
 
     /// The backend's description of it; `None` for formats or shapes the host does not know.
     pub fn desc(&self) -> Option<TextureDesc> {
+        self.desc_dropping(0)
+    }
+
+    /// [`Self::desc`] without its `drop` most detailed mips ([`mips_to_drop`]): the host texture
+    /// starts at console mip `drop`, at that mip's size.
+    pub fn desc_dropping(&self, drop: u32) -> Option<TextureDesc> {
         let depth = self.flags & DEPTH_STENCIL != 0;
         let mut format = format(self.format)?;
         // A typeless 32-bit float is a depth target when the texture is one.
@@ -69,13 +75,14 @@ impl TextureInfo {
             _ if self.depth_or_layers > 1 => (TexDim::D2Array, self.depth_or_layers as usize),
             _ => (TexDim::D2, 1),
         };
+        let drop = drop.min(self.layout.mips.len().saturating_sub(1) as u32);
         Some(TextureDesc {
             dim,
             format,
-            width: self.width as usize,
-            height: self.height.max(1) as usize,
+            width: (self.width >> drop).max(1) as usize,
+            height: (self.height.max(1) >> drop).max(1) as usize,
             depth_or_layers: d,
-            mips: self.layout.mips.len().max(1),
+            mips: self.layout.mips.len().max(1) - drop as usize,
             render_target: self.render_target(),
             unordered_access: self.flags & UNORDERED_ACCESS != 0,
         })
@@ -220,13 +227,76 @@ struct Level {
     slice_pitch: usize,
 }
 
+/// Textures whose larger side is below this keep every mip under `VICTORY_TEXTURE_DROP_MIPS`.
+const DROP_FROM: u32 = 1024;
+/// A texture never drops below this size on its larger side.
+const DROP_KEEP: u32 = 256;
+
+/// How many of its most detailed mips the host leaves out of title texture `info` when
+/// `VICTORY_TEXTURE_DROP_MIPS=asked`. Only sampled 2D textures (and arrays and cubes) of at least
+/// [`DROP_FROM`] with mips below them qualify: nothing the GPU writes (targets, depth, unordered
+/// access, which also must keep their size), no 3D. The top two mips of a texture hold about 94 %
+/// of its bytes, and on 16 GB Macs the full set runs out of GPU memory at the world load (#8).
+///
+/// guess: the title samples these through views that leave the mip choice to the sampler, so the
+/// host's smaller texture only looks blurrier. A shader that loads an explicit mip (`image_load_mip`)
+/// or sizes coordinates from the console's own descriptor rather than a size query reads a
+/// different mip or scale; that is the price of the switch, which is off by default.
+pub fn mips_to_drop(info: &TextureInfo, asked: u32) -> u32 {
+    let mips = info.layout.mips.len() as u32;
+    if asked == 0
+        || mips < 2
+        || info.render_target()
+        || info.flags & UNORDERED_ACCESS != 0
+        || info.dimension == Dimension::Tex3d
+        || info.desc().is_none_or(|d| d.format.is_depth())
+    {
+        return 0;
+    }
+    let side = info.width.max(info.height);
+    if side < DROP_FROM {
+        return 0;
+    }
+    let mut drop = asked.min(mips - 1);
+    while drop > 0 && side >> drop < DROP_KEEP {
+        drop -= 1;
+    }
+    drop
+}
+
+/// A view's `(first mip, count)` of the console texture, as mips of its host texture that left
+/// out the `drop` most detailed ones. A view of only dropped mips gets the most detailed one kept.
+pub fn view_mips_dropping((first, count): (u32, u32), drop: u32) -> (u32, u32) {
+    if first >= drop {
+        return (first - drop, count);
+    }
+    let left_out = drop - first;
+    (0, count.saturating_sub(left_out).max(1))
+}
+
+/// The bytes of the `drop` most detailed mips of `info`, every slice (what leaving them out saves).
+fn dropped_bytes(info: &TextureInfo, drop: u32) -> u64 {
+    let layout = &info.layout;
+    let slices = if info.dimension == Dimension::Tex3d { 1 } else { layout.slices } as u64;
+    let n = u64::from(layout.desc.element_bytes);
+    (0..drop.min(layout.mips.len() as u32))
+        .map(|mip| {
+            let m = &layout.mips[mip as usize];
+            u64::from(m.width) * u64::from(m.height) * n * slices
+        })
+        .sum()
+}
+
 /// Detiles every mip of every slice of `tiled` (a texture's whole memory): the levels detiled,
 /// and the error that stopped it short if one did.
-fn detile(layout: &Layout, dimension: Dimension, format: u32, tiled: &[u8]) -> (Vec<Level>, Result<(), String>) {
+/// With `drop` (a host texture made by [`TextureInfo::desc_dropping`]), the mips above console mip
+/// `drop` are not detiled at all, and console mip `drop + i` is host level `i`.
+fn detile(layout: &Layout, dimension: Dimension, format: u32, tiled: &[u8], drop: u32) -> (Vec<Level>, Result<(), String>) {
     let slices = if dimension == Dimension::Tex3d { 1 } else { layout.slices };
     let n = layout.desc.element_bytes as usize;
     let mut levels = Vec::new();
-    for mip in 0..layout.mips.len() as u32 {
+    let drop = drop.min(layout.mips.len().saturating_sub(1) as u32);
+    for mip in drop..layout.mips.len() as u32 {
         let m = &layout.mips[mip as usize];
         let row = m.width as usize * n;
         let slice_pitch = row * m.height as usize;
@@ -237,7 +307,7 @@ fn detile(layout: &Layout, dimension: Dimension, format: u32, tiled: &[u8]) -> (
                 return (levels, Err(format!("detile mip {mip} slice {slice}: {e:?}")));
             }
             to_host(format, &mut texels);
-            levels.push(Level { mip: mip as usize, slice: slice as usize, texels, row, slice_pitch });
+            levels.push(Level { mip: (mip - drop) as usize, slice: slice as usize, texels, row, slice_pitch });
         }
     }
     (levels, Ok(()))
@@ -256,7 +326,19 @@ pub fn upload<B: ResourceBackend>(
     info: &TextureInfo,
     tiled: &[u8],
 ) -> Result<(), String> {
-    let (levels, result) = detile(&info.layout, info.dimension, info.format, tiled);
+    upload_dropping(backend, tex, info, tiled, 0)
+}
+
+/// [`upload`] into a host texture made by [`TextureInfo::desc_dropping`]: console mip `drop` goes
+/// to host mip 0, and the mips above it are not detiled at all.
+pub fn upload_dropping<B: ResourceBackend>(
+    backend: &B,
+    tex: &B::Texture,
+    info: &TextureInfo,
+    tiled: &[u8],
+    drop: u32,
+) -> Result<(), String> {
+    let (levels, result) = detile(&info.layout, info.dimension, info.format, tiled, drop);
     upload_levels(backend, tex, &levels);
     result
 }
@@ -481,6 +563,8 @@ pub struct Tracked<B: ResourceBackend> {
     sampled_sees_writes: bool,
     unchanged_whole: u8,
     skipped: u32,
+    /// The most detailed mips its host texture leaves out ([`mips_to_drop`]).
+    dropped_mips: u32,
     /// Whether its last whole read met an unmapped or protected range (fine mips not mapped yet).
     partial: bool,
     /// Its last upload was all zeros: it is probed (`Title::blank_keys`) until written, however
@@ -803,7 +887,8 @@ impl<B: PresentBackend> Title<B> {
         let Some(info) = self.pending.remove(&key) else {
             return false;
         };
-        let Some(desc) = info.desc() else {
+        let drop = mips_to_drop(&info, self.drop_mips);
+        let Some(desc) = info.desc_dropping(drop) else {
             // Loud once per format: views of it get no texture and their draws sample nothing.
             static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
             let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -821,6 +906,18 @@ impl<B: PresentBackend> Title<B> {
             }
         };
         self.host.register_texture(key, &tex);
+        self.host.set_dropped_mips(key, drop);
+        if drop > 0 {
+            const EVERY: u64 = 256 << 20;
+            let before = self.stats.dropped_mip_bytes;
+            self.stats.dropped_mip_bytes += dropped_bytes(&info, drop);
+            if self.stats.dropped_mip_bytes / EVERY > before / EVERY {
+                tracing::info!(
+                    saved_mb = self.stats.dropped_mip_bytes >> 20,
+                    "host textures: mips left out so far (VICTORY_TEXTURE_DROP_MIPS)"
+                );
+            }
+        }
         static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Depth-stencil textures are GPU-written depth targets whose CPU tile layout (e.g.
@@ -858,6 +955,7 @@ impl<B: PresentBackend> Title<B> {
                 sampled_sees_writes: false,
                 unchanged_whole: 0,
                 skipped: 0,
+                dropped_mips: drop,
                 partial: false,
                 blank: false,
                 #[cfg(target_os = "macos")]
@@ -866,6 +964,23 @@ impl<B: PresentBackend> Title<B> {
             },
         );
         true
+    }
+
+    /// The host texture's mip for console mip `mip` of title texture `key` (realized): `None` for
+    /// a mip its host texture left out (`VICTORY_TEXTURE_DROP_MIPS`). A kept mip has the console
+    /// mip's own size, as the host texture starts at the first kept mip's size.
+    pub fn host_mip(&self, key: usize, mip: usize) -> Option<usize> {
+        let drop = self.textures.get(&key).map_or(0, |t| t.dropped_mips as usize);
+        mip.checked_sub(drop)
+    }
+
+    /// Counts a GPU copy dropped because it names a mip a host texture left out, logged once.
+    pub fn copy_of_dropped_mip(&mut self) {
+        self.stats.dropped_mip_copies += 1;
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!("native host drops work: a texture copy of a mip the host texture left out (VICTORY_TEXTURE_DROP_MIPS; first time)");
+        });
     }
 
     /// The format of the host texture of title texture `key`.
@@ -1071,6 +1186,7 @@ impl<B: PresentBackend> Title<B> {
                 format: t.info.format,
                 dimension: t.info.dimension,
                 layout: t.info.layout.clone(),
+                dropped_mips: t.dropped_mips,
                 last: t.last,
                 partial: t.partial,
             })
@@ -1184,6 +1300,8 @@ pub(super) struct Job {
     format: u32,
     dimension: Dimension,
     layout: Layout,
+    /// The most detailed mips its host texture leaves out ([`mips_to_drop`]): not detiled.
+    dropped_mips: u32,
     /// The hash of what the host texture holds: memory that still hashes to it is not detiled.
     last: Option<blake3::Hash>,
     /// Whether an earlier whole read met an unmapped or protected range.
@@ -1250,7 +1368,7 @@ impl Job {
         let read = started.elapsed();
         let hash = blake3::hash(tiled);
         let hashed = started.elapsed();
-        let levels = (self.last != Some(hash)).then(|| detile(&self.layout, self.dimension, self.format, tiled));
+        let levels = (self.last != Some(hash)).then(|| detile(&self.layout, self.dimension, self.format, tiled, self.dropped_mips));
         Ready {
             key: self.key,
             serial: self.serial,
@@ -1715,4 +1833,125 @@ mod tests {
         assert!(out[..2 * page].iter().all(|&b| b == 0x5a));
         assert!(out[2 * page..].iter().all(|&b| b == 0xa5));
     }
+
+    fn drop_info(dimension: Dimension, format: u32, side: u32, layers: u32, mips: u32, flags: u32) -> TextureInfo {
+        use victory_formats::texture::{Desc, Swizzle};
+        let desc = Desc {
+            dimension,
+            width: side,
+            height: side,
+            depth: layers,
+            mips,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_S,
+        };
+        let layout = Layout::new(&desc).unwrap();
+        TextureInfo {
+            dimension,
+            format,
+            width: side,
+            height: side,
+            depth_or_layers: layers,
+            flags,
+            size: layout.size as usize,
+            layout,
+            memory: std::ptr::null(),
+        }
+    }
+
+    /// Only large sampled 2D textures with mips to spare drop any, never below `DROP_KEEP`.
+    #[test]
+    fn only_large_sampled_textures_drop_mips() {
+        use Dimension::{Tex2d, Tex3d};
+        let rgba = 28; // R8G8B8A8_UNORM
+        assert_eq!(mips_to_drop(&drop_info(Tex2d, rgba, 2048, 1, 12, 0), 0), 0, "off by default");
+        assert_eq!(mips_to_drop(&drop_info(Tex2d, rgba, 2048, 1, 12, 0), 2), 2);
+        assert_eq!(mips_to_drop(&drop_info(Tex2d, rgba, 2048, 6, 12, 0), 2), 2, "arrays and cubes too");
+        assert_eq!(mips_to_drop(&drop_info(Tex2d, rgba, 1024, 1, 11, 0), 4), 2, "kept at 256 or more");
+        assert_eq!(mips_to_drop(&drop_info(Tex2d, rgba, 512, 1, 10, 0), 2), 0, "small");
+        assert_eq!(mips_to_drop(&drop_info(Tex2d, rgba, 2048, 1, 1, 0), 2), 0, "no mips below");
+        assert_eq!(mips_to_drop(&drop_info(Tex2d, rgba, 2048, 1, 2, 0), 2), 1, "one left at least");
+        assert_eq!(mips_to_drop(&drop_info(Tex2d, rgba, 2048, 1, 12, RENDER_TARGET), 2), 0);
+        assert_eq!(mips_to_drop(&drop_info(Tex2d, rgba, 2048, 1, 12, UNORDERED_ACCESS), 2), 0);
+        assert_eq!(mips_to_drop(&drop_info(Tex2d, 40, 2048, 1, 12, DEPTH_STENCIL), 2), 0, "depth");
+        assert_eq!(mips_to_drop(&drop_info(Tex3d, rgba, 1024, 4, 3, 0), 2), 0, "3D");
+    }
+
+    /// The host texture starts at the first mip kept, at its size, with the mips below it.
+    #[test]
+    fn a_dropping_desc_starts_at_the_first_mip_kept() {
+        let info = drop_info(Dimension::Tex2d, 28, 2048, 1, 12, 0);
+        let full = info.desc().unwrap();
+        let d = info.desc_dropping(2).unwrap();
+        assert_eq!((full.width, full.height, full.mips), (2048, 2048, 12));
+        assert_eq!((d.width, d.height, d.mips), (512, 512, 10));
+        assert_eq!((d.format, d.dim, d.depth_or_layers), (full.format, full.dim, full.depth_or_layers));
+        // Each of the two dropped levels' bytes: 2048² and 1024² texels of 4 bytes.
+        assert_eq!(dropped_bytes(&info, 2), (2048 * 2048 + 1024 * 1024) * 4);
+    }
+
+    /// Views move down by the mips dropped; one of dropped mips alone gets the first kept.
+    #[test]
+    fn views_move_down_by_the_dropped_mips() {
+        assert_eq!(view_mips_dropping((0, u32::MAX), 0), (0, u32::MAX));
+        assert_eq!(view_mips_dropping((0, u32::MAX), 2), (0, u32::MAX - 2));
+        assert_eq!(view_mips_dropping((0, 12), 2), (0, 10));
+        assert_eq!(view_mips_dropping((3, 4), 2), (1, 4));
+        assert_eq!(view_mips_dropping((2, 1), 2), (0, 1));
+        assert_eq!(view_mips_dropping((1, 1), 2), (0, 1), "only dropped mips");
+        assert_eq!(view_mips_dropping((0, 2), 2), (0, 1), "only dropped mips");
+        assert_eq!(view_mips_dropping((1, 3), 2), (0, 2));
+    }
+
+    /// Console mip `drop + i` lands in host mip `i`, every slice, for linear and swizzled layouts.
+    #[test]
+    fn an_upload_dropping_mips_puts_each_kept_mip_where_the_host_has_it() {
+        use victory_formats::texture::{Desc, Swizzle};
+        let Ok(metal) = victory_metal::metal::Metal::new() else { return };
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_S] {
+            let (side, layers, mips, drop) = (1024u32, 2u32, 6u32, 2u32);
+            let desc = Desc { dimension: Dimension::Tex2d, width: side, height: side, depth: layers, mips, element_bytes: 4, block: 1, samples: 1, swizzle };
+            let layout = Layout::new(&desc).unwrap();
+            let pattern = |mip: u32, slice: u32, n: usize| -> Vec<u8> {
+                (0..n).map(|i| (i % 253) as u8 ^ (mip * 41 + slice * 7) as u8).collect()
+            };
+            let mut tiled = vec![0u8; layout.size as usize];
+            for mip in 0..mips {
+                let m = &layout.mips[mip as usize];
+                let row = m.width as usize * 4;
+                for slice in 0..layers {
+                    let linear = pattern(mip, slice, row * m.height as usize);
+                    layout.tile(&mut tiled, mip, slice, &linear, row, linear.len()).unwrap();
+                }
+            }
+            let info = TextureInfo {
+                dimension: Dimension::Tex2d,
+                format: 28,
+                width: side,
+                height: side,
+                depth_or_layers: layers,
+                flags: 0,
+                size: tiled.len(),
+                layout,
+                memory: std::ptr::null(),
+            };
+            assert_eq!(mips_to_drop(&info, drop), drop);
+            let tex = metal.create_texture(&info.desc_dropping(drop).unwrap()).unwrap();
+            upload_dropping(&metal, &tex, &info, &tiled, drop).unwrap();
+            for host_mip in 0..(mips - drop) {
+                let m = &info.layout.mips[(host_mip + drop) as usize];
+                let row = m.width as usize * 4;
+                for slice in 0..layers {
+                    let n = row * m.height as usize;
+                    let mut got = vec![0u8; n];
+                    metal.read_texture(&tex, host_mip as usize, slice as usize, &mut got, row, n);
+                    let want = pattern(host_mip + drop, slice, got.len());
+                    assert!(got == want, "{swizzle:?}: host mip {host_mip} slice {slice} is not console mip {}", host_mip + drop);
+                }
+            }
+        }
+    }
+
 }

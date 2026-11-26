@@ -69,9 +69,15 @@ log="$run_dir/victory.log"
 } > "$log"
 
 export VICTORY_GUESS_GRAPHICS="${VICTORY_GUESS_GRAPHICS:-1}"
+# On <=16 GB Macs even Series S runs out of GPU memory once the world streams in
+# (#8): large sampled textures leave out their two most detailed mips there.
+# VICTORY_TEXTURE_DROP_MIPS=0 keeps every mip.
+if (( ram_gb <= 16 )); then
+  export VICTORY_TEXTURE_DROP_MIPS="${VICTORY_TEXTURE_DROP_MIPS:-2}"
+fi
 # Press Enter (the pad's A) every 2 s from 4 s to 80 s unless VICTORY_KEYS is set.
 export VICTORY_KEYS="${VICTORY_KEYS:-$(seq 4 2 80 | sed 's/$/:Enter/' | paste -sd, -)}"
-echo "Running $exe (console=$console)"
+echo "Running $exe (console=$console${VICTORY_TEXTURE_DROP_MIPS:+, texture mips dropped=$VICTORY_TEXTURE_DROP_MIPS})"
 echo "Log: $log"
 
 "$bin" run --execute --console "$console" ${headless[@]+"${headless[@]}"} --unimplemented zero "$exe" >> "$log" 2>&1 &

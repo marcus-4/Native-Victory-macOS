@@ -1007,6 +1007,19 @@ there).
   height and descriptor height - 1, the query fix alone `[16, 8, 16383]`, and both fixes
   `[16, 8, 7]`. **Not tested:** a game run; the shadow edges themselves.
 
+#### Large sampled textures without their most detailed mips (`VICTORY_TEXTURE_DROP_MIPS=N`)
+
+On 16 GB Macs even the Series S profile runs out of GPU memory once the world streams in (#8: `kIOGPUCommandBufferCallbackErrorOutOfMemory` on an M1 Pro and an M4). One tester's local experiment that left the two most detailed mips out of sampled textures kept the macOS memory level near 80 % where it otherwise fell to 12–14 % (#8). With `VICTORY_TEXTURE_DROP_MIPS=N` (at most 4; 0 or unset keeps every mip), the host does that:
+
+* **Which textures** (`textures::mips_to_drop`). Sampled 2D textures, arrays and cubes whose larger side is at least 1024 and that have mips below. Nothing the GPU writes (render targets, depth, unordered access: those must keep their size), no 3D. A texture keeps at least 256 on its larger side and at least one mip.
+* **What changes.** The host texture is made at console mip `N`'s size with the mips from there down (`TextureInfo::desc_dropping`). Uploads detile only those mips, so the CPU's detile work shrinks with the memory. Console mip `N + i` goes to host mip `i` (`upload_dropping`). The title's memory and its hashes are untouched.
+* **Views** (`NativeHost::dropped_mips`). An SRV's `(first mip, count)` moves down by `N`. A view of dropped mips only gets the most detailed mip kept.
+* **GPU copies** (`CopyResource`, `CopyTextureRegion`, `Title::host_mip`). Each side's console mip goes to its host mip. Kept mips have the console's own sizes, so boxes and origins stay as they are. A copy into or out of a dropped mip is skipped and counted (`Stats::dropped_mip_copies`, warned once).
+* **Saving.** The top two mips are about 94 % of a texture's bytes. The running total is logged every 256 MB: `host textures: mips left out so far saved_mb=`.
+* **guess.** The title samples these through views that leave the mip choice to the sampler, so the result only looks blurrier. A shader that loads an explicit mip, or sizes coordinates from the console descriptor instead of a size query, gets a different mip or scale.
+* **Default.** Off in the host. `tools/macos/run-native.sh` sets `N = 2` on Macs with 16 GB or less (where Series S is the default too); `VICTORY_TEXTURE_DROP_MIPS=0` turns it off there.
+* **Tested** (`textures::tests`): which textures qualify, the shrunken description, the view shift, on Metal (M1 Pro, macOS 14.2) that every kept mip and slice of a linear and a 64 KB swizzled texture lands in the right host mip, and (macOS 27.2) that copies into and out of a kept mip round-trip through its host mip while a copy into a dropped one is skipped. **Not tested:** a game run; the view shift through a translated shader.
+
 #### Texture formats the host lacked
 
 The title's texture formats are DXGI numbers (`resource::pc_format` only renames the console's depth views 118 to 120). The first warnings ("a title texture format the host does not represent") named ten of them; once those were mapped, the run reached more textures and named fifteen more. All of them but two now map to a Metal format of the same element size (`descriptors::format`, tested against `resource::element` in `host_formats_have_the_title_formats_element_size`):

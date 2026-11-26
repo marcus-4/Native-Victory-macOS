@@ -1867,14 +1867,21 @@ pub(crate) fn copy_texture_resource(this: This, dst: This, src: This) -> bool {
                 let s = mip_dims(&src_info, mip);
                 let d = mip_dims(&dst_info, mip);
                 let size = [s[0].min(d[0]), s[1].min(d[1]), s[2].min(d[2])];
+                // A host texture that left out its top mips has the rest at the console's sizes.
+                let (Some(src_mip), Some(dst_mip)) =
+                    (t.host_mip(src as usize, mip), t.host_mip(dst as usize, mip))
+                else {
+                    t.copy_of_dropped_mip();
+                    continue;
+                };
                 l.list.copy_texture_region(
                     &src_tex,
-                    mip,
+                    src_mip,
                     slice,
                     [0, 0, 0],
                     size,
                     &dst_tex,
-                    mip,
+                    dst_mip,
                     slice,
                     [0, 0, 0],
                 );
@@ -1934,6 +1941,13 @@ pub(crate) fn copy_texture_region(
                 else {
                     return false;
                 };
+                let (Some(src_mip), Some(dst_mip)) = (
+                    t.host_mip(src.resource as usize, src_mip),
+                    t.host_mip(dst.resource as usize, dst_mip),
+                ) else {
+                    t.copy_of_dropped_mip();
+                    return true;
+                };
                 l.list.copy_texture_region(
                     &src_tex,
                     src_mip,
@@ -1984,6 +1998,10 @@ pub(crate) fn copy_texture_region(
                 let Some(dst_tex) = t.texture_of(dst.resource as usize) else {
                     return false;
                 };
+                let Some(dst_mip) = t.host_mip(dst.resource as usize, dst_mip) else {
+                    t.copy_of_dropped_mip();
+                    return true;
+                };
                 l.list.copy_buffer_to_texture(
                     src_addr,
                     len,
@@ -2022,6 +2040,10 @@ pub(crate) fn copy_texture_region(
             with_list(this, |t, l| {
                 let Some(src_tex) = t.texture_of(src.resource as usize) else {
                     return false;
+                };
+                let Some(src_mip) = t.host_mip(src.resource as usize, src_mip) else {
+                    t.copy_of_dropped_mip();
+                    return true;
                 };
                 l.list.copy_texture_to_buffer(
                     &src_tex,

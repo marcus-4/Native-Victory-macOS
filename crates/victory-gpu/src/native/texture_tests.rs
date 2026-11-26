@@ -1386,3 +1386,65 @@ fn depth_stencil_rows_go_in_and_out_as_the_depth_plane() {
         assert_eq!(got, values[at..at + 4], "row {r}");
     }
 }
+
+/// With `VICTORY_TEXTURE_DROP_MIPS`, GPU copies of a texture that left out its top mips go to the
+/// host mip that holds the console's: a footprint copied into console mip 3 of a 1024x1024 texture
+/// (host mip 1 with two left out) comes back out of it, and a copy into a dropped mip is skipped
+/// and counted, not encoded at the wrong level.
+#[test]
+fn texture_copies_follow_the_mips_a_host_texture_left_out() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let _ = with_title(|t| t.set_drop_mips(0));
+        }
+    }
+    let Some(pool) = pool(9205, (9 << 20) / page_size() + 1) else { return };
+    let tex = crate::resource::test_texture_at(pool.va(0), (1024, 1024), 11, 28, Swizzle::SW_64KB_S.0, 0);
+    let up_buf = crate::resource::test_buffer_at(pool.va(0x80_0000), 0x4000);
+    let down_buf = crate::resource::test_buffer_at(pool.va(0x81_0000), 0x4000);
+    let pitch = 256usize;
+    let mut staged = vec![0u8; 7 * pitch + 8 * 4];
+    for y in 0..8usize {
+        for x in 0..8usize {
+            let at = y * pitch + x * 4;
+            staged[at..at + 4].copy_from_slice(&[x as u8 * 13, y as u8 * 29, 91, 255]);
+        }
+    }
+    pool.write(0x80_0000, &staged);
+    with_title(|t| t.set_drop_mips(2)).unwrap();
+    let _reset = Reset;
+
+    let list = crate::list::test_list(false, std::ptr::null());
+    let q = crate::queue::test_queue(false);
+    let mut f = std::ptr::null();
+    crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut f);
+    type Region = extern "system" fn(This, *const crate::list::CopyLocation, u32, u32, u32, *const crate::list::CopyLocation, *const [u32; 6]);
+    let src_fp = crate::list::CopyLocation::placed(up_buf, crate::resource::PlacedFootprint::new(0, 28, 8, 8, pitch as u32));
+    let whole = [0u32, 0, 0, 8, 8, 1];
+    // Into console mip 3 (128x128) at (16, 32), and into console mip 0, which is left out.
+    let mip3 = crate::list::CopyLocation::subresource(tex, 3);
+    slot::<Region>(list, 0x80)(list, &mip3, 16, 32, 0, &src_fp, &whole);
+    let before = with_title(|t| t.stats.dropped_mip_copies).unwrap();
+    let mip0 = crate::list::CopyLocation::subresource(tex, 0);
+    slot::<Region>(list, 0x80)(list, &mip0, 0, 0, 0, &src_fp, &whole);
+    assert_eq!(with_title(|t| t.stats.dropped_mip_copies).unwrap(), before + 1, "the copy into a dropped mip");
+    assert_eq!(with_title(|t| (t.host_mip(tex as usize, 3), t.host_mip(tex as usize, 1))).unwrap(), (Some(1), None));
+    // And back out of console mip 3.
+    let dst_fp = crate::list::CopyLocation::placed(down_buf, crate::resource::PlacedFootprint::new(0, 28, 8, 8, pitch as u32));
+    let back = [16u32, 32, 0, 24, 40, 1];
+    slot::<Region>(list, 0x80)(list, &dst_fp, 0, 0, 0, &mip3, &back);
+
+    assert_eq!(slot::<extern "system" fn(This) -> i32>(list, 0x48)(list), 0);
+    slot::<extern "system" fn(This, u32, *const This)>(q, 0x50)(q, 1, &list);
+    slot::<extern "system" fn(This, This, u64) -> i32>(q, 0x70)(q, f, 1);
+    assert_eq!(slot::<extern "system" fn(This, u64, *mut std::ffi::c_void) -> i32>(f, 0x48)(f, 1, std::ptr::null_mut()), 0);
+    let mut readback = vec![0u8; staged.len()];
+    assert!(crate::native::safe_read(pool.va(0x81_0000) as *const u8, &mut readback));
+    for y in 0..8usize {
+        for x in 0..8usize {
+            let at = y * pitch + x * 4;
+            assert_eq!(&readback[at..at + 4], &staged[at..at + 4], "texel ({x}, {y}) of console mip 3");
+        }
+    }
+}

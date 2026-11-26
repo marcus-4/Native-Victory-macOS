@@ -138,6 +138,10 @@ pub struct Stats {
     pub detiles: u64,
     /// Textures whose layout the host cannot detile (counted once per content).
     pub undetilable: u64,
+    /// Bytes of console mips left out of host textures (`VICTORY_TEXTURE_DROP_MIPS`).
+    pub dropped_mip_bytes: u64,
+    /// GPU texture copies dropped because they name a mip a host texture left out.
+    pub dropped_mip_copies: u64,
 }
 
 /// What a title pipeline object became on the host.
@@ -216,6 +220,9 @@ pub struct Title<B: PresentBackend> {
     /// Keys of textures whose last upload was blank, probed after `hot_keys` until written.
     pub(super) blank_keys: Vec<usize>,
     pub(super) blank_cursor: usize,
+    /// The most detailed mips left out of large sampled textures (`VICTORY_TEXTURE_DROP_MIPS=N`,
+    /// 0 by default; see [`super::textures::mips_to_drop`]).
+    pub(super) drop_mips: u32,
     /// Reusable scratch buffer for hot-texture probes (avoids per-submission allocations).
     pub(super) probe_buf: Vec<u8>,
     /// Where `Present` shows frames, if the app gave a layer.
@@ -237,7 +244,22 @@ pub struct Title<B: PresentBackend> {
     pub stats: Stats,
 }
 
+/// `VICTORY_TEXTURE_DROP_MIPS`: a count of mips (at most 4), or nothing.
+fn drop_mips_asked(v: Option<&str>) -> u32 {
+    let n = v.and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0).min(4);
+    if n > 0 {
+        tracing::info!(mips = n, "host textures: large sampled textures leave out their most detailed mips (VICTORY_TEXTURE_DROP_MIPS)");
+    }
+    n
+}
+
 impl<B: PresentBackend> Title<B> {
+    /// Leaves the `n` most detailed mips out of large sampled textures realized from now on
+    /// (what `VICTORY_TEXTURE_DROP_MIPS=n` sets).
+    pub fn set_drop_mips(&mut self, n: u32) {
+        self.drop_mips = n.min(4);
+    }
+
     pub fn new(backend: B, memory: Arc<PoolTable>) -> Self {
         let host = NativeHost::with_memory(backend, memory);
         host.collect_written(std::env::var("VICTORY_TEXTURE_BACK").as_deref() == Ok("1"));
@@ -256,6 +278,7 @@ impl<B: PresentBackend> Title<B> {
             hot_cursor: 0,
             blank_keys: Vec::new(),
             blank_cursor: 0,
+            drop_mips: drop_mips_asked(std::env::var("VICTORY_TEXTURE_DROP_MIPS").ok().as_deref()),
             probe_buf: Vec::new(),
             surface: None,
             pending: HashMap::new(),

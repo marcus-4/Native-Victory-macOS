@@ -28,6 +28,9 @@ pub struct NativeHost<B: GraphicsBackend> {
     resources: RefCell<HashMap<usize, Res<Rc<B::Texture>>>>,
     /// Counts changes to [`Self::resources`], so unrealized table entries retry once registered.
     resources_epoch: std::cell::Cell<u64>,
+    /// Title textures whose host texture leaves out its most detailed mips, and how many
+    /// (`VICTORY_TEXTURE_DROP_MIPS`): their views are moved down by as many.
+    dropped_mips: RefCell<HashMap<usize, u32>>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
     contract: RefCell<Contract<B>>,
     /// Draws and dispatches dropped because they read a root parameter the title never set.
@@ -143,6 +146,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             maps: RefCell::default(),
             resources: RefCell::default(),
             resources_epoch: std::cell::Cell::new(0),
+            dropped_mips: RefCell::default(),
             heaps: RefCell::default(),
             contract: RefCell::default(),
             unset_roots: std::cell::Cell::new(0),
@@ -261,6 +265,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
     }
 
     pub fn register_texture(&self, key: usize, texture: &Rc<B::Texture>) {
+        self.dropped_mips.borrow_mut().remove(&key);
         self.resources
             .borrow_mut()
             .insert(key, Res::Texture(texture.clone()));
@@ -340,8 +345,17 @@ impl<B: GraphicsBackend> NativeHost<B> {
 
     /// The title released resource object `key`: later views naming it decode to nothing.
     pub fn forget_resource(&self, key: usize) {
+        self.dropped_mips.borrow_mut().remove(&key);
         if self.resources.borrow_mut().remove(&key).is_some() {
             self.resources_epoch.set(self.resources_epoch.get() + 1);
+        }
+    }
+
+    /// Title texture `key`'s host texture (registered just before) leaves out its `drop` most
+    /// detailed mips: views of it are made over the mips it has.
+    pub fn set_dropped_mips(&self, key: usize, drop: u32) {
+        if drop > 0 {
+            self.dropped_mips.borrow_mut().insert(key, drop);
         }
     }
 
@@ -358,6 +372,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             self.resources_epoch.set(self.resources_epoch.get() + 1);
         }
         let texture = matches!(removed, Some(Res::Texture(_)));
+        self.dropped_mips.borrow_mut().remove(&key);
         if !texture {
             return;
         }
@@ -450,6 +465,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 let Some(Res::Texture(tex)) = resources.get(&resource) else {
                     return Ok(false);
                 };
+                let drop = self.dropped_mips.borrow().get(&resource).copied().unwrap_or(0);
+                let mips = mips.map(|m| super::textures::view_mips_dropping(m, drop));
                 match (mips, format) {
                     (Some((first, count)), Some(format)) if count > 0 => {
                         let v = self.backend.create_texture_view(
