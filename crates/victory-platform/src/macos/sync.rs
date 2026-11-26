@@ -1,5 +1,5 @@
 //! macOS implementation of `sync`: mutex and condition variable objects,
-//! and `os_sync` (macOS 14.4 and later) for wait-on-address.
+//! and `os_sync` (macOS 14.4 and later, `__ulock` before) for wait-on-address.
 
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -134,18 +134,98 @@ impl Semaphore {
 
 const OS_CLOCK_MACH_ABSOLUTE_TIME: u32 = 32;
 
+type OsWait = unsafe extern "C" fn(*mut u32, u64, usize, u32) -> i32;
+type OsWaitTimeout = unsafe extern "C" fn(*mut u32, u64, usize, u32, u32, u64) -> i32;
+type OsWake = unsafe extern "C" fn(*mut u32, usize, u32) -> i32;
+
+/// `os_sync` exists from macOS 14.4 only, so it is looked up when first needed
+/// rather than linked (a hard link fails to load, and to build, before 14.4).
+/// Earlier systems get the same kernel wait through `__ulock_wait2` /
+/// `__ulock_wake` (macOS 11 and later), as Rust's own std does.
+struct OsSync {
+    wait: OsWait,
+    wait_timeout: OsWaitTimeout,
+    wake_any: OsWake,
+    wake_all: OsWake,
+}
+
+const RTLD_DEFAULT: *mut std::ffi::c_void = -2isize as *mut std::ffi::c_void;
+const UL_COMPARE_AND_WAIT: u32 = 1;
+const ULF_WAKE_ALL: u32 = 0x100;
+
 unsafe extern "C" {
-    fn os_sync_wait_on_address(addr: *mut u32, value: u64, size: usize, flags: u32) -> i32;
-    fn os_sync_wait_on_address_with_timeout(
-        addr: *mut u32,
-        value: u64,
-        size: usize,
-        flags: u32,
-        clock: u32,
-        timeout_ns: u64,
-    ) -> i32;
-    fn os_sync_wake_by_address_any(addr: *mut u32, size: usize, flags: u32) -> i32;
-    fn os_sync_wake_by_address_all(addr: *mut u32, size: usize, flags: u32) -> i32;
+    fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+    fn __ulock_wait2(op: u32, addr: *mut std::ffi::c_void, value: u64, timeout_ns: u64, value2: u64) -> i32;
+    fn __ulock_wake(op: u32, addr: *mut std::ffi::c_void, wake_value: u64) -> i32;
+}
+
+fn os_sync() -> Option<&'static OsSync> {
+    static FNS: std::sync::OnceLock<Option<OsSync>> = std::sync::OnceLock::new();
+    FNS.get_or_init(|| {
+        if std::env::var_os("VICTORY_NO_OS_SYNC").is_some() {
+            return None;
+        }
+        let find = |name: &std::ffi::CStr| {
+            // SAFETY: a lookup in the loaded images by a NUL-terminated name.
+            let p = unsafe { dlsym(RTLD_DEFAULT, name.as_ptr()) };
+            (!p.is_null()).then_some(p)
+        };
+        let wait = find(c"os_sync_wait_on_address")?;
+        let wait_timeout = find(c"os_sync_wait_on_address_with_timeout")?;
+        let wake_any = find(c"os_sync_wake_by_address_any")?;
+        let wake_all = find(c"os_sync_wake_by_address_all")?;
+        // SAFETY: these are the documented os_sync signatures.
+        unsafe {
+            Some(OsSync {
+                wait: std::mem::transmute::<*mut std::ffi::c_void, OsWait>(wait),
+                wait_timeout: std::mem::transmute::<*mut std::ffi::c_void, OsWaitTimeout>(wait_timeout),
+                wake_any: std::mem::transmute::<*mut std::ffi::c_void, OsWake>(wake_any),
+                wake_all: std::mem::transmute::<*mut std::ffi::c_void, OsWake>(wake_all),
+            })
+        }
+    })
+    .as_ref()
+}
+
+/// One kernel wait while `*p == expected`, for at most `timeout_ns` (`None`: no
+/// limit). As `os_sync`: >= 0 when woken or the value differs, -1 with errno set.
+///
+/// # Safety
+/// `p` is a live 4-byte aligned atomic.
+unsafe fn wait_once(fns: Option<&OsSync>, p: *mut u32, expected: u32, timeout_ns: Option<u64>) -> i32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        match (fns, timeout_ns) {
+            (Some(f), None) => (f.wait)(p, u64::from(expected), 4, 0),
+            (Some(f), Some(ns)) => {
+                (f.wait_timeout)(p, u64::from(expected), 4, 0, OS_CLOCK_MACH_ABSOLUTE_TIME, ns)
+            }
+            // __ulock_wait2 takes 0 as "no limit", so a limit is at least 1 ns.
+            (None, t) => __ulock_wait2(
+                UL_COMPARE_AND_WAIT,
+                p.cast(),
+                u64::from(expected),
+                t.map_or(0, |ns| ns.max(1)),
+                0,
+            ),
+        }
+    }
+}
+
+/// Wakes one or every thread waiting on `p` (no waiter is not an error).
+///
+/// # Safety
+/// `p` is a live 4-byte aligned atomic.
+unsafe fn wake(fns: Option<&OsSync>, p: *mut u32, all: bool) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        match (fns, all) {
+            (Some(f), false) => (f.wake_any)(p, 4, 0),
+            (Some(f), true) => (f.wake_all)(p, 4, 0),
+            (None, false) => __ulock_wake(UL_COMPARE_AND_WAIT, p.cast(), 0),
+            (None, true) => __ulock_wake(UL_COMPARE_AND_WAIT | ULF_WAKE_ALL, p.cast(), 0),
+        }
+    };
 }
 
 /// Blocks while `*addr == expected` (`WaitOnAddress`). Returns at once if it
@@ -163,7 +243,7 @@ pub fn wait_on_address(addr: &AtomicU32, expected: u32, timeout: Option<Duration
         // SAFETY: `p` is a live 4-byte aligned atomic.
         let r = unsafe {
             match deadline {
-                None => os_sync_wait_on_address(p, u64::from(expected), 4, 0),
+                None => wait_once(os_sync(), p, expected, None),
                 Some(d) => {
                     let Some(left) = d.checked_duration_since(Instant::now()) else {
                         return addr.load(Ordering::Acquire) != expected;
@@ -171,14 +251,7 @@ pub fn wait_on_address(addr: &AtomicU32, expected: u32, timeout: Option<Duration
                     if left.is_zero() {
                         return addr.load(Ordering::Acquire) != expected;
                     }
-                    os_sync_wait_on_address_with_timeout(
-                        p,
-                        u64::from(expected),
-                        4,
-                        0,
-                        OS_CLOCK_MACH_ABSOLUTE_TIME,
-                        left.as_nanos().min(u128::from(u64::MAX)) as u64,
-                    )
+                    wait_once(os_sync(), p, expected, Some(left.as_nanos().min(u128::from(u64::MAX)) as u64))
                 }
             }
         };
@@ -196,17 +269,60 @@ pub fn wait_on_address(addr: &AtomicU32, expected: u32, timeout: Option<Duration
 /// Wakes one thread blocked in [`wait_on_address`] on `addr`.
 pub fn wake_one(addr: &AtomicU32) {
     // SAFETY: `addr` is a live 4-byte aligned atomic.
-    unsafe { os_sync_wake_by_address_any(addr.as_ptr(), 4, 0) };
+    unsafe { wake(os_sync(), addr.as_ptr(), false) };
 }
 
 /// Wakes every thread blocked in [`wait_on_address`] on `addr`.
 pub fn wake_all(addr: &AtomicU32) {
     // SAFETY: as above.
-    unsafe { os_sync_wake_by_address_all(addr.as_ptr(), 4, 0) };
+    unsafe { wake(os_sync(), addr.as_ptr(), true) };
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Both kernel paths (os_sync where the system has it, and the __ulock
+    /// fallback every supported macOS has): a changed value returns at once, an
+    /// unchanged one times out, and a wake releases a waiter.
+    #[test]
+    fn wait_on_address_works_on_both_kernel_paths() {
+        let paths: Vec<Option<&OsSync>> = match os_sync() {
+            Some(f) => vec![Some(f), None],
+            None => vec![None],
+        };
+        for fns in paths {
+            let a = Arc::new(AtomicU32::new(7));
+            let p = a.as_ptr();
+            // SAFETY: `a` is live for each call.
+            unsafe {
+                assert!(wait_once(fns, p, 8, Some(1_000_000_000)) >= 0, "value differs");
+                let t = Instant::now();
+                assert_eq!(wait_once(fns, p, 7, Some(20_000_000)), -1, "timed out");
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(60));
+                assert!(t.elapsed() >= Duration::from_millis(15));
+                wake(fns, p, false); // no waiter
+            }
+            for all in [false, true] {
+                a.store(7, Ordering::SeqCst);
+                let w = Arc::clone(&a);
+                let fns_addr = fns.map(|f| f as *const OsSync as usize);
+                let h = std::thread::spawn(move || {
+                    let fns = fns_addr.map(|f| unsafe { &*(f as *const OsSync) });
+                    while w.load(Ordering::SeqCst) == 7 {
+                        // SAFETY: `w` is live.
+                        unsafe { wait_once(fns, w.as_ptr(), 7, None) };
+                    }
+                });
+                std::thread::sleep(Duration::from_millis(20));
+                a.store(9, Ordering::SeqCst);
+                // SAFETY: `a` is live.
+                unsafe { wake(fns, a.as_ptr(), all) };
+                h.join().unwrap();
+            }
+        }
+    }
     use super::Semaphore;
     use std::sync::{Barrier, mpsc};
     use std::thread;
