@@ -420,3 +420,94 @@ fn a_size_query_of_a_writable_image_reads_its_size() {
     assert_eq!(f.get(0x2_0000, 3), [16, 8, 7], "width, height and height - 1 from the descriptor");
     drop(records);
 }
+
+/// A compute program (32 lanes) that stores four dwords per lane through the writable buffer view
+/// in its table at user data 4, by element index (`idxen`, the lane): `0x100 + lane`, `0x200 +
+/// lane`, `0x300 + lane`, `0x400 + lane`. `store` is the store's two words. Assembled with llvm-mc
+/// (gfx1030).
+fn cs_store(store: &[u32]) -> Vec<u32> {
+    vec![
+        0xBE8A_0304, // s_mov_b32 s10, s4
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+        0x4A02_00FF, 0x0000_0100, // v_add_nc_u32 v1, 0x100, v0
+        0x4A04_00FF, 0x0000_0200, // v_add_nc_u32 v2, 0x200, v0
+        0x4A06_00FF, 0x0000_0300, // v_add_nc_u32 v3, 0x300, v0
+        0x4A08_00FF, 0x0000_0400, // v_add_nc_u32 v4, 0x400, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ]
+    .into_iter()
+    .chain(store.iter().copied())
+    .chain([0xBF81_0000]) // s_endpgm
+    .collect()
+}
+/// `v_lshlrev_b32 v5, 4, v0; buffer_store_dwordx4 v[1:4], v5, s[12:15], 0 offen`: the control,
+/// by byte offset through a raw view.
+const STORE_DWORDX4_OFFEN: [u32; 3] = [0x340A_0084, 0xE078_1000, 0x8003_0105];
+/// `buffer_store_format_xyzw v[1:4], v0, s[12:15], 0 idxen`
+const STORE_FORMAT_XYZW: [u32; 2] = [0xE01C_2000, 0x8003_0100];
+/// `buffer_store_dwordx4 v[1:4], v0, s[12:15], 0 idxen`
+const STORE_DWORDX4: [u32; 2] = [0xE078_2000, 0x8003_0100];
+
+/// #255: stores by element index (`idxen`) through a structured (16-byte) or typed
+/// (`R32G32B32A32_UINT`) writable buffer view, made the way the title makes them (through
+/// `CreateUnorderedAccessView`'s description, not descriptor words by hand), with
+/// `buffer_store_format_xyzw` and with `buffer_store_dwordx4`, against a raw view stored by byte
+/// offset as the control.
+///
+/// On main (2a3b03d1) the control stores all 128 dwords and the four indexed cases store none,
+/// anywhere in the pool: the loss is not the formatted store's. A table entry from FSPX metadata
+/// gives no stride, so the translation reads the view's stride from the host's view-stride table
+/// (`VIEW_STRIDES`), which only the D3D12 host binds; the native host binds none, so the stride
+/// reads 0. Fails until the native host binds that table.
+#[test]
+fn formatted_and_dword_stores_through_structured_and_typed_buffer_views() {
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let want: Vec<u32> = (0..32u32).flat_map(|l| [0x100 + l, 0x200 + l, 0x300 + l, 0x400 + l]).collect();
+    // (what, DXGI format, structure stride, view flags, elements, stores)
+    let idx: &[(&str, &[u32])] = &[("buffer_store_format_xyzw", &STORE_FORMAT_XYZW), ("buffer_store_dwordx4", &STORE_DWORDX4)];
+    let views: [(&str, u32, u32, u32, u32, &[(&str, &[u32])]); 3] = [
+        ("raw (control)", 0, 0, 1, 128, &[("buffer_store_dwordx4 offen", &STORE_DWORDX4_OFFEN)]),
+        ("structured 16-byte", 0, 16, 0, 32, idx),
+        ("typed R32G32B32A32_UINT", 3, 0, 0, 32, idx),
+    ];
+    let mut report = Vec::new();
+    for (what, format, stride, flags, elements, stores) in views {
+        for &(store_name, store) in stores {
+            f.put(0x2_0000, &[0u32; 128]);
+            let c = crate::pipeline::test_compute_container(&cs_store(store), &[uav], 7);
+            let cs = shaders::translate(&c).unwrap();
+            let records = vec![0u32; 8];
+            let start = records.as_ptr() as u64;
+            let heap = t.host.heap(HeapKind::Resource, start, 1).unwrap();
+            let mut resource = [0u32; 14];
+            resource[0] = 1;
+            // D3D12_UNORDERED_ACCESS_VIEW_DESC: format, BUFFER, the elements, the stride, the flags.
+            let mut view = [0u32; 16];
+            (view[0], view[1], view[4], view[5], view[8]) = (format, 1, elements, stride, flags);
+            [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+            crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, start);
+            assert!(t.host.mirror(start).unwrap(), "{what}");
+            let Pipe::Compute(pso) = t.compute_pipe(&cs, "store") else { panic!("{:?}", t.shaders) };
+            let mut l = NativeList::default();
+            l.set_heaps(Some(&heap), None);
+            l.set_compute_pipeline(&pso);
+            l.set_compute_root_table(0, &heap, 0);
+            l.dispatch(1, 1, 1).unwrap();
+            super::run(&t.host, &[&l]);
+            let got = f.get(0x2_0000, 128);
+            let right = got.iter().zip(&want).filter(|(a, b)| a == b).count();
+            report.push(format!("{what} {store_name}: {right}/128 dwords right, first {:x?}", &got[..4]));
+            drop(records);
+        }
+    }
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    let bad: Vec<_> = report.iter().filter(|r| !r.contains(" 128/128 ")).collect();
+    assert!(bad.is_empty(), "{report:#?}");
+}
