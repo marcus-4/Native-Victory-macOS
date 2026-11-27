@@ -924,6 +924,12 @@ impl<'a> Lower<'a> {
                         || n.starts_with("v_permlane")
                         || n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                        // The console wave's first lane, not each host wave's (#254), unless it
+                        // is a waterfall loop's read (the lane's own), or of a scalar, a constant
+                        // or a VGPR just moved from one (each half's first lane holds it).
+                        || (n == "v_readfirstlane_b32"
+                            && !i.writes.iter().any(|w| x.res.waterfall.reads.contains(&w.1))
+                            && !first_lane_of_a_scalar(p, i))
                         // One atomic per console wave; addresses by console lane.
                         || matches!(n, "ds_append" | "ds_consume")
                         || n.contains("addtid")
@@ -9097,6 +9103,9 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
+                if let Some(r) = self.split_first_lane(inst, a)? {
+                    return int(self, r);
+                }
                 self.s.flags |= flags::WAVE_OPS;
                 let r = self.s.op(
                     c,
@@ -14304,6 +14313,30 @@ pub(crate) fn once_blocks(p: &Program) -> Vec<bool> {
             !reach(b, false, None)[b] && !ends_around
         })
         .collect()
+}
+
+/// Whether `v_readfirstlane_b32` `i` reads a scalar, a constant, or a VGPR whose value a plain
+/// `v_mov_b32` moved from one: every lane holds the same value, so each half's first lane reads it.
+fn first_lane_of_a_scalar(p: &Program, i: &Inst) -> bool {
+    use crate::gfx10::Operand;
+    let Fields::Valu(v) = &i.fields else {
+        return false;
+    };
+    let reg = match v.src.first() {
+        Some(Operand::Vector { reg, .. }) => *reg,
+        Some(_) => return true,
+        None => return false,
+    };
+    let Some(value) = i.read(Reg::V(reg)) else {
+        return false;
+    };
+    p.blocks.iter().flat_map(|b| b.insts.iter()).any(|d| {
+        d.writes.iter().any(|w| w.1 == value)
+            && d.name() == "v_mov_b32"
+            && matches!(&d.fields, Fields::Valu(m) if m.dpp.is_none() && m.sdwa.is_none()
+                && matches!(m.src.first(), Some(Operand::Scalar { .. } | Operand::Const(_) | Operand::Literal(_))))
+            && d.read(Reg::S(crate::ir::EXEC)) == i.read(Reg::S(crate::ir::EXEC))
+    })
 }
 
 /// SCC values that can differ between the host waves of one console wave:

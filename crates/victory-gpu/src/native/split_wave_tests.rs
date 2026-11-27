@@ -1235,3 +1235,78 @@ fn a_mask_a_divergent_loop_swaps_away_and_back_by_xors_is_the_mask_it_entered_wi
     assert_eq!(got[16..20], [2; 4]);
     assert_eq!(got[20..], [0; 12]);
 }
+
+/// `v_readfirstlane_b32` of a wave64 program split into two host waves reads the first lane of
+/// the console's 64-lane EXEC in both halves, as the console does (#254); assembled with llvm-mc
+/// (gfx1030, wavefrontsize64).
+const V_READFIRSTLANE_S12_V0: u32 = 0x7E18_0500;
+const V_MOV_V2_S12: u32 = 0x7E04_020C;
+const S_MOV_EXEC_LANES_8_9: [u32; 2] = [0xBEFE_04FF, 0x0000_0300];
+const S_MOV_EXEC_ALL: u32 = 0xBEFE_04C1;
+
+/// Every lane on: lane 0's value, in the upper half too (each half used to read its own first
+/// lane, so lanes 32-63 read 32).
+#[test]
+fn a_first_lane_read_with_every_lane_on_reads_lane_0_in_both_halves() {
+    let w = [V_READFIRSTLANE_S12_V0, V_MOV_V2_S12, V_LSHLREV_V1_2_V0, GLOBAL_STORE_V2_AT_V1[0], GLOBAL_STORE_V2_AT_V1[1], S_ENDPGM];
+    assert_eq!(refusal(&w), None, "a group of two console waves translates it exactly");
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got, vec![0; 64]);
+}
+
+/// EXEC set to lanes 8 and 9 (the repro of #254): every lane reads lane 8's value, in a group of
+/// two console waves too (an EXEC a scalar move sets leaves every thread running, so the halves
+/// meet).
+#[test]
+fn a_first_lane_read_under_a_narrowed_exec_reads_the_first_lane_on() {
+    let mut w = S_MOV_EXEC_LANES_8_9.to_vec();
+    w.extend([V_READFIRSTLANE_S12_V0, S_MOV_EXEC_ALL, V_MOV_V2_S12, V_LSHLREV_V1_2_V0]);
+    w.extend(GLOBAL_STORE_V2_AT_V1);
+    w.push(S_ENDPGM);
+    assert_eq!(refusal(&w), None);
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got, vec![8; 64]);
+}
+
+/// A value every lane of the console wave holds (a user SGPR) needs no exchange: each half reads
+/// its own first lane, which holds it, under any EXEC.
+#[test]
+fn a_first_lane_read_of_a_wave_uniform_value_stays_in_its_half() {
+    let mut w = vec![0x7E06_0204]; // v_mov_b32 v3, s4
+    w.extend(S_MOV_EXEC_LANES_8_9);
+    w.extend([0x7E1A_0503, S_MOV_EXEC_ALL, 0x7E04_020D, V_LSHLREV_V1_2_V0]); // v_readfirstlane_b32 s13, v3; ..; v_mov_b32 v2, s13
+    w.extend(GLOBAL_STORE_V2_AT_V1);
+    w.push(S_ENDPGM);
+    assert_eq!(refusal(&w), None);
+    let got = run(&w, 0, 77);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got, vec![77; 64]);
+}
+
+/// Inside a branch that lanes 40 and up skip, the halves cannot meet: the fast path refuses rather
+/// than read each half's first lane (lanes 32-39 used to read 32), and a group of one console wave
+/// gets lane 0's value from lockstep.
+#[test]
+fn a_first_lane_read_in_a_branch_some_lanes_skip_is_refused_or_exact() {
+    let body = [V_READFIRSTLANE_S12_V0, V_MOV_V2_S12, V_LSHLREV_V1_2_V0, GLOBAL_STORE_V2_AT_V1[0], GLOBAL_STORE_V2_AT_V1[1]];
+    let mut w = LANES_BELOW_40.to_vec();
+    w.push(skip_execz(body.len() as u32));
+    w.extend(body);
+    w.push(S_ENDPGM);
+    let why = refusal(&w).expect("refused where the halves cannot meet");
+    assert!(why.contains("first lane read across the two host waves"), "{why}");
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..40], [0; 40]);
+    assert_eq!(got[40..], [CANARY; 24]);
+}

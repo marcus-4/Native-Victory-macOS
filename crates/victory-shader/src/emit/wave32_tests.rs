@@ -266,8 +266,11 @@ fn lds_a_wave_shares_unsynced_in_divergent_code_is_refused() {
 
 #[test]
 fn a_branch_on_a_first_lane_read_is_not_uniform_across_the_halves() {
-    // `v_readfirstlane` reads each host wave's own first lane (0 and 32 here), so a branch on
-    // what it gives can split the console wave: the halves would not meet at a barrier.
+    // `v_readfirstlane` reads the console wave's first lane in both halves since #254, through an
+    // exchange of its own (its 4 barriers below). The branch analysis still counts an SCC made from
+    // one as split (`split_scc`, which the per-half read of mesh programs needs), so nothing after
+    // the branch exchanges: the `v_readlane` there gets none of its own (its value, unused here, is
+    // dropped), and LDS behind the branch gets no barrier.
     const FIRST: [u32; 3] = [
         0x7E04_0500, // v_readfirstlane_b32 s2, v0
         0xBF06_8002, // s_cmp_eq_u32 s2, 0
@@ -281,7 +284,7 @@ fn a_branch_on_a_first_lane_read_is_not_uniform_across_the_halves() {
         S_ENDPGM,
     ]);
     let l = host32(&readlane, 64);
-    assert_eq!((l.barriers, l.exchanges), (0, false));
+    assert_eq!((l.barriers, l.exchanges), (4, true));
     // LDS written and read behind such a branch (over 6 words): no barrier fits.
     let mut lds = FIRST.to_vec();
     lds[2] = 0xBF84_0006; // s_cbranch_scc0 6

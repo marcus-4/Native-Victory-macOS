@@ -980,6 +980,56 @@ Tested with our own shader (`tex_fill.hlsl`) on an M2 Pro: a 64x64 RGBA8 2D text
 
 A world run on an M5 Pro (Series S, windowed, reported on [#151](https://github.com/LakshanSivakumar/Native-Victory-macOS/pull/151)) named 22 textures as copied back (15 2D, 4 3D, 3 1D; the largest 256x256x16, 4 MiB), none too large, with no frame rate change beyond run-to-run noise up to the first world frame. The run then crashed (image+0x55e56f8, also without the switch), so whether boats float is still unknown. That count may be low: a texture skipped on its first completion was not logged then (fixed since).
 
+#### First lane reads of a split console wave read the console's first lane (#254, fixed)
+
+A wave64 compute program runs as two 32-lane host waves. `v_readfirstlane_b32` lowered to DXIL's
+`waveReadLaneFirst`, which reads the first lane of each host wave, its own half. The console reads
+the first lane on in its 64-lane EXEC, and every lane sees that value. With every lane on, lanes
+32-63 read lane 32's value instead of lane 0's. With EXEC set to lanes 8 and 9, every lane read
+lane 0's. The six culling compute programs of the world (#258) end in this read: each wave reads
+the old count of its atomic add from its own half's first lane.
+
+`Lower::split_first_lane` now takes one of three routes:
+
+* **A value the same in every lane** (`Lower::wave_uniform`) keeps the per-half read, which is
+  then exact. Uniform here means:
+  * constants, and SGPR inputs (user data);
+  * scalar instructions of uniform values. A lane mask a scalar instruction reads as a number
+    counts too: with the halves on it is the console's 64 bits in both.
+  * first lane reads, except a waterfall loop's;
+  * values an earlier whole-wave section left the same in every lane;
+  * scalar joins of uniform values;
+  * VALU instructions of uniform values with no DPP and no lane mask operand, made under the
+    read's own EXEC or the entry EXEC. Their read of their destination's old value does not
+    count: only lanes outside EXEC keep it.
+* **Otherwise, where both halves arrive together** (`exchange_site`), the lane is the lowest bit
+  of EXEC as the instruction reads it, and the value is read across the halves (`wide_read_lane`).
+  An EXEC a scalar move narrows leaves every thread running, so the repro of #254 takes this route.
+* **Otherwise it is refused** ("a first lane read across the two host waves of a console wave, in
+  divergent code"). A group of one console wave is then retried in lockstep, which reads it
+  exactly.
+
+A first lane read of a VGPR, unless of a waterfall loop or a VGPR just moved from a scalar or a
+constant, now turns on the console's lane numbering (`console_lanes`) and the halves. That costs
+4 bytes of group-shared memory per thread and two barriers per exchanged read.
+
+* **guess:** the entry EXEC of a compute wave holds every lane any later EXEC turns on.
+* **Not changed:** `split_scc` still counts an SCC made from a first lane read as split, which
+  the per-half read of mesh programs needs. So nothing behind a branch on one exchanges. For a
+  compute program that is now conservative, not wrong; a follow-up could treat it as uniform.
+* **Tested** (`split_wave_tests`, Metal, two console waves a group, which lockstep does not take;
+  M1 Pro, macOS 27.2):
+
+  | Test | Before | After |
+  | --- | --- | --- |
+  | every lane on | 32 in lanes 32-63 | 0 in all |
+  | EXEC = lanes 8 and 9 (the repro) | 0 | 8 in all |
+  | a branch lanes 40 and up skip | lanes 32-39 read 32 | fast path refuses; lockstep reads 0 |
+  | a user SGPR moved to a VGPR, under a narrowed EXEC | right | still read per half, not refused |
+
+* **Not measured:** the corpus by output fingerprint (no game data here); how many programs
+  change or become refused.
+
 #### Size queries of writable images read 0 (fixed)
 
 A program that asks a writable image (a UAV) for its size got 0x0. The translator wrote the level of
