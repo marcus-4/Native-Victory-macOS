@@ -1310,3 +1310,20 @@ fn a_first_lane_read_in_a_branch_some_lanes_skip_is_refused_or_exact() {
     assert_eq!(got[..40], [0; 40]);
     assert_eq!(got[40..], [CANARY; 24]);
 }
+
+/// With EXEC empty the console's first lane read reads lane 0 (RDNA 2 ISA, `v_readfirstlane_b32`).
+/// The lowest set bit of an empty EXEC used to come out as lane 31 (`FirstbitLo(0)` is all ones,
+/// plus 32); found in review of #254 by evan-kolberg. Both the fast path and lockstep.
+#[test]
+fn a_first_lane_read_with_exec_empty_reads_lane_0() {
+    let mut w = vec![0xBEFE_0480]; // s_mov_b64 exec, 0
+    w.extend([V_READFIRSTLANE_S12_V0, S_MOV_EXEC_ALL, V_MOV_V2_S12, V_LSHLREV_V1_2_V0]);
+    w.extend(GLOBAL_STORE_V2_AT_V1);
+    w.push(S_ENDPGM);
+    assert_eq!(refusal(&w), None);
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got, vec![0; 64]);
+}

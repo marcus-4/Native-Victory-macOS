@@ -1014,6 +1014,9 @@ constant, now turns on the console's lane numbering (`console_lanes`) and the ha
 4 bytes of group-shared memory per thread and two barriers per exchanged read.
 
 * **guess:** the entry EXEC of a compute wave holds every lane any later EXEC turns on.
+* **An empty EXEC** reads lane 0, as the RDNA 2 ISA gives. The lane selector, shared with
+  lockstep, came out as lane 31: `FirstbitLo(0)` is all ones, plus 32 (found by evan-kolberg in
+  review of #254). Test: `a_first_lane_read_with_exec_empty_reads_lane_0`.
 * **Not changed:** `split_scc` still counts an SCC made from a first lane read as split, which
   the per-half read of mesh programs needs. So nothing behind a branch on one exchanges. For a
   compute program that is now conservative, not wrong; a follow-up could treat it as uniform.

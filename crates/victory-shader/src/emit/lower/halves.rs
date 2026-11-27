@@ -322,7 +322,7 @@ impl Lower<'_> {
     }
 
     /// The console lane `v_readfirstlane_b32` reads in lockstep (`lockstep.rs`): the lowest bit of
-    /// EXEC as `inst` reads it, as a number (0 when none is set).
+    /// EXEC as `inst` reads it, as a number (0 when none is set, as the console reads lane 0).
     pub(super) fn lockstep_first_lane(&mut self, inst: &crate::ir::Inst) -> Result<V, Why> {
         use crate::ir::{EXEC, Reg};
         let c = self.cur;
@@ -339,8 +339,11 @@ impl Lower<'_> {
         let fhi = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
         let (z, k32, k63) = (self.s.m.i32(0), self.s.m.i32(32), self.s.m.i32(63));
         let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
-        let low = self.s.m.cmp(c, pred::NE, lo, z);
-        let r = self.s.m.select(c, low, flo, fhi);
+        // An empty EXEC reads lane 0 (RDNA 2 ISA): `FirstbitLo(0)` is all ones, which plus 32
+        // came out as lane 31 (found in review of #254 by evan-kolberg).
+        let (low, high) = (self.s.m.cmp(c, pred::NE, lo, z), self.s.m.cmp(c, pred::NE, hi, z));
+        let upper = self.s.m.select(c, high, fhi, z);
+        let r = self.s.m.select(c, low, flo, upper);
         Ok(self.s.m.bin(c, Bin::And, r, k63))
     }
 
