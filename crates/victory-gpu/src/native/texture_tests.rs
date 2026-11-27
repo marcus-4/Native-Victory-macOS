@@ -2619,3 +2619,72 @@ fn a_placed_copy_another_placement_covers_is_given_up_once_unused() {
     assert_eq!(draw_sampling(&mut t, &pool, old, 4), [0x44, 0, 0, 0x44]);
     drop(views);
 }
+
+/// Compute writes reach packed 16-bit textures (B5G5R5A1, B4G4R4A4) through their typed views on
+/// the native host. D3DMetal has no typed store for them, so under Wine the title's sun term (a
+/// B5G5R5A1 texture a compute pass fills) came out black and forks there keep such textures as
+/// R8G8B8A8 (halfwave50/VIctory-macOS-halfwave50 0c0d5ca, from Belobug da580e4e). Metal through
+/// the Shader Converter stores them exactly, so the native host keeps their formats; this holds it.
+#[test]
+fn compute_writes_reach_packed_16_bit_textures() {
+    if super::host().is_none() {
+        return;
+    }
+    let dxil = include_bytes!("../../../victory-metal/tests/fixtures/tex_fill.dxil");
+    const W: u32 = 64;
+    for (n, format) in [28u32, 86, 115].into_iter().enumerate() {
+        let mut t = Title::new(victory_metal::metal::Metal::new().unwrap(), Default::default());
+        let mem = Alias::new((64 << 10).max(page_size())).unwrap();
+        let info = PoolInfo { id: 9300 + n, base: mem.primary as usize, len: mem.len, memory_entry: None };
+        t.host.memory().pool_created(&info);
+        t.host.memory().mapped(mem.alias as usize, mem.len, &info, 0);
+        let pool = Pool { mem };
+        t.set_texture_back(true);
+        let res = crate::resource::test_texture_at(pool.va(0), (u64::from(W), W), 1, format, Swizzle::LINEAR.0, 4);
+        let info = crate::resource::texture_info(res).unwrap();
+        let key = res as usize;
+        pool.write(0, &vec![0u8; info.size]);
+        let slots = vec![0u32; 8 * 8];
+        let handle = slots.as_ptr() as u64;
+        let uav = [format, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+        crate::descriptor::create_uav(std::ptr::null(), res, std::ptr::null(), &uav, handle);
+        t.texture_created(key, info.clone());
+        assert!(t.realize(key));
+        let heap = t.host.heap(HeapKind::Resource, handle, 8).unwrap();
+        let pso = t.host.compute_pipeline(dxil, [8, 8, 1]).unwrap();
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_table(0, &heap, 0);
+        l.dispatch(W / 8, W / 8, 1).unwrap();
+        t.ensure_queue(1).unwrap();
+        t.submit(1, vec![(l, vec![])]);
+        t.signal_queue(1, 11, 0, 1);
+        let start = std::time::Instant::now();
+        while !t.try_wait(11, 0, 1) {
+            assert!(start.elapsed().as_secs() < 10);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mut out = vec![0u8; info.size];
+        assert!(crate::native::safe_read(pool.va(0) as *const u8, &mut out));
+        let nonzero = out.iter().filter(|&&b| b != 0).count();
+        let bpp = if format == 28 { 4 } else { 2 };
+        let pitch = info.size / W as usize;
+        let mut bad = 0;
+        for y in 0..W as usize {
+            for x in 0..W as usize {
+                let t = &out[y * pitch + x * bpp..y * pitch + x * bpp + bpp];
+                let (r, g, b, a) = match format {
+                    28 => (t[0] as u32, t[1] as u32, t[2] as u32, t[3] as u32),
+                    86 => { let v = u16::from_le_bytes([t[0], t[1]]) as u32; (((v >> 10) & 31) * 255 / 31, ((v >> 5) & 31) * 255 / 31, (v & 31) * 255 / 31, (v >> 15) * 255) }
+                    _ => { let v = u16::from_le_bytes([t[0], t[1]]) as u32; (((v >> 8) & 15) * 17, ((v >> 4) & 15) * 17, (v & 15) * 17, (v >> 12) * 17) }
+                };
+                let tol = if format == 28 { 0 } else { 18 };
+                let near = |got: u32, want: u32| got.abs_diff(want) <= tol;
+                if !(near(r, x as u32) && near(g, y as u32) && near(b, 64) && near(a, 255)) { bad += 1; }
+            }
+        }
+        assert!(nonzero > 0, "format {format}: nothing was written");
+        assert_eq!(bad, 0, "format {format}: texels off by more than one step of the format");
+    }
+}
