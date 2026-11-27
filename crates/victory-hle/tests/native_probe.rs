@@ -10,18 +10,40 @@ use std::sync::OnceLock;
 
 use victory_loader::native::NativeImage;
 
+/// The probe, built once; `None` when the cross tools it needs are not installed
+/// (`build-native-probe.sh` exits 3 and names the one missing).
+fn built_probe() -> Option<&'static Path> {
+    static BUILT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("native-probe.exe");
+            let status = Command::new(root.join("tools/macos/build-native-probe.sh"))
+                .arg(&out)
+                .status()
+                .expect("running build-native-probe.sh");
+            if status.code() == Some(3) && std::env::var_os("VICTORY_REQUIRE_PROBE").is_none() {
+                return None;
+            }
+            assert!(status.success(), "building the native probe failed");
+            Some(out)
+        })
+        .as_deref()
+}
+
+/// Whether the probe could be built. Without the cross tools the test says it
+/// is skipped and passes (`VICTORY_REQUIRE_PROBE=1` makes that a failure), as
+/// the GPU tests do without the Metal Shader Converter.
+fn have_probe() -> bool {
+    let have = built_probe().is_some();
+    if !have {
+        eprintln!("skipped: the native probe's cross tools are not installed (brew install llvm lld mingw-w64)");
+    }
+    have
+}
+
 fn probe_exe() -> &'static Path {
-    static BUILT: OnceLock<PathBuf> = OnceLock::new();
-    BUILT.get_or_init(|| {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("native-probe.exe");
-        let status = Command::new(root.join("tools/macos/build-native-probe.sh"))
-            .arg(&out)
-            .status()
-            .expect("running build-native-probe.sh");
-        assert!(status.success(), "building the native probe failed");
-        out
-    })
+    built_probe().expect("the native probe")
 }
 
 /// Maps the probe at an address nothing is mapped at (found, not assumed:
@@ -54,6 +76,9 @@ fn probe_bytes() -> Vec<u8> {
 
 #[test]
 fn an_image_maps_and_relocates_at_another_base() {
+    if !have_probe() {
+        return;
+    }
     let bytes = probe_bytes();
     let preferred = NativeImage::map(&bytes, None).unwrap();
     let (moved, at) = map_elsewhere(&bytes);
@@ -78,6 +103,9 @@ fn an_image_maps_and_relocates_at_another_base() {
 
 #[test]
 fn finalize_gives_sections_their_protections() {
+    if !have_probe() {
+        return;
+    }
     let (image, _) = map_elsewhere(&probe_bytes());
     image.finalize().unwrap();
     use victory_platform::mem::{Protect, query};
@@ -246,17 +274,26 @@ mod run {
 
     #[test]
     fn threads_notices_suspension_and_context() {
+        if !have_probe() {
+            return;
+        }
         assert_all(run_probe("probe_threads", 0), 0xFF, "probe_threads");
     }
 
     #[test]
     fn waits_critical_sections_srw_locks_and_condition_variables() {
+        if !have_probe() {
+            return;
+        }
         // Bits 8 and up of probe_threads' enum belong to probe_sync.
         assert_all(run_probe("probe_sync", 0) >> 8, 0x7FFFF >> 8, "probe_sync");
     }
 
     #[test]
     fn files_open_read_seek_find_and_write() {
+        if !have_probe() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("hello.txt"), "hello, victory\n").unwrap();
         let wide: Vec<u16> = dir
@@ -279,6 +316,9 @@ mod run {
     /// ordinal 1 played through COM vtables of host stubs, under Rosetta.
     #[test]
     fn network_media_and_audio_imports_work() {
+        if !have_probe() {
+            return;
+        }
         assert_all(run_probe("probe_netaudio", 0), 0xFFF, "probe_netaudio");
     }
 
@@ -286,6 +326,9 @@ mod run {
     /// table (Windows x64 registers and stack, `this` still the object's address).
     #[test]
     fn the_d3d12_device_and_its_fence_are_called_through_bridged_tables() {
+        if !have_probe() {
+            return;
+        }
         victory_gpu::object::set_bridge(victory_gpu::object::Bridge {
             is_bridged: native::is_bridged,
             copy_of: native::bridged_copy_of,
@@ -298,6 +341,9 @@ mod run {
 
     #[test]
     fn the_c_runtime_serves_a_title_that_links_it() {
+        if !have_probe() {
+            return;
+        }
         // The probe imports `ucrtbase.dll` and `api-ms-win-crt-math-l1-1-0.dll`:
         // strings, math (doubles in xmm registers), printf and scanf over a
         // `va_list`, qsort with a title comparator, files, heap, time,
@@ -314,6 +360,9 @@ mod run {
 
     #[test]
     fn exceptions_reach_seh_scopes_and_vectored_handlers() {
+        if !have_probe() {
+            return;
+        }
         // The probe's vectored handler hears every thread's exceptions.
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         assert_all(run_probe("probe_seh", 0), 0x1_FFFF, "probe_seh");
@@ -326,6 +375,9 @@ mod run {
     /// and the title finds it by name.
     #[test]
     fn a_title_dll_has_its_own_main_tls_unwinding_and_name() {
+        if !have_probe() {
+            return;
+        }
         // It raises exceptions, which another probe's vectored handler would hear.
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         assert_all(run_probe("probe_dll", 0), 0xFFF, "probe_dll");
@@ -342,6 +394,9 @@ mod run {
     /// `ERROR_PROC_NOT_FOUND` for an unknown name.
     #[test]
     fn system_dll_handles_resolve_functions_through_the_binder() {
+        if !have_probe() {
+            return;
+        }
         assert_all(run_probe("probe_modules", 0), 0x7FF, "probe_modules");
     }
 
@@ -351,12 +406,18 @@ mod run {
     /// runtime calls a title callback back with GS = the TEB.
     #[test]
     fn hle_objects_are_callable_through_their_method_tables() {
+        if !have_probe() {
+            return;
+        }
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         assert_all(run_probe("probe_vtable", 0), 0x1FF, "probe_vtable");
     }
 
     #[test]
     fn the_probe_runs_under_rosetta_and_passes_every_check() {
+        if !have_probe() {
+            return;
+        }
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let (image, _) = load(false, UnimplementedPolicy::Trap);
         // SAFETY: the probe is our own code; imports are bound.
@@ -372,6 +433,9 @@ mod run {
 
     #[test]
     fn the_probe_also_runs_relocated() {
+        if !have_probe() {
+            return;
+        }
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let (image, _) = load(true, UnimplementedPolicy::Trap);
         assert_ne!(image.base(), image.info().image_base as usize);
@@ -382,6 +446,9 @@ mod run {
 
     #[test]
     fn an_unimplemented_import_returns_zero_when_asked_to() {
+        if !have_probe() {
+            return;
+        }
         let (_, missing) = load(false, UnimplementedPolicy::ReturnZero);
         // SAFETY: a function of one argument in the bound probe.
         assert_eq!(unsafe { call_win64(missing, &[0]) }, 0);
@@ -392,6 +459,9 @@ mod run {
     /// System V) is called from Windows-ABI code that expects them back.
     #[test]
     fn the_bridge_preserves_windows_callee_saved_registers() {
+        if !have_probe() {
+            return;
+        }
         extern "C" fn clobber() -> u64 {
             // SAFETY: clobbers registers the System V ABI lets us.
             unsafe {

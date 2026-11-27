@@ -13,6 +13,11 @@ fn list_imports_binds_the_probe_and_does_not_run_it() {
         .arg(&exe)
         .status()
         .unwrap();
+    // Exit 3: the probe's cross tools are not installed (see native_probe.rs).
+    if built.code() == Some(3) && std::env::var_os("VICTORY_REQUIRE_PROBE").is_none() {
+        eprintln!("skipped: the native probe's cross tools are not installed (brew install llvm lld mingw-w64)");
+        return;
+    }
     assert!(built.success());
 
     let output = Command::new(env!("CARGO_BIN_EXE_victory"))
